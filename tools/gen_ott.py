@@ -1,59 +1,111 @@
 #!/usr/bin/env python3
-"""Generate ott_tables.h: fixed 3-band crossover biquads + compression gain LUT.
+"""Generate ott_tables.h: faithful 3-band OTT tables for the OP-XY.
 
 Everything the audio loop needs is precomputed here so the device does no
 float, log, exp or division per sample. All coefficients and gains are fixed
 point; the crossover coeffs are stored /SCALE (device multiplies back).
+
+Design (matches a real Xfer-OTT-style compressor, cf. Sephonix/sps-dsp):
+  * Crossovers are 4th-order Linkwitz-Riley (two cascaded Butterworth biquads
+    per branch, 24 dB/oct). The low band passes an allpass equal to the high
+    crossover so all three bands are phase-matched and sum flat (no notches).
+  * Per band a dB-domain static curve does upward AND downward compression with
+    its own thresholds, ratios, soft knee, and input/output (makeup) trims --
+    the classic OTT per-band defaults. Curves are baked to per-band gain LUTs.
+  * Per-band attack/release, scaled by the Time macro.
 """
 import numpy as np
 
 FS = 44100.0
 SCALE = 4.0                 # biquad coeff scaling (output * SCALE on device)
-F1, F2 = 120.0, 2500.0      # crossover frequencies (low|mid, mid|high)
-QBW = 0.70710678            # Butterworth
+F1, F2 = 88.3, 2500.0       # crossover frequencies (low|mid, mid|high) -- OTT
+SQRT2 = np.sqrt(2.0)        # Butterworth damping (Q = 1/sqrt2)
 Q31 = (1 << 31)
 
-# Compression curve
-TARGET = 0.25               # -12 dBFS target level (linear)
-K_DOWN = 0.70               # downward strength (1 = infinite ratio to target)
-K_UP = 0.85                 # upward strength
-GMIN, GMAX = 0.125, 8.0     # gain limits (-18 .. +18 dB)
-GAIN_Q = 26                 # gain stored in Q26 (range +/-32)
+# --- Compression (per band): classic Xfer OTT factory defaults ---------------
+# (attack ms, release ms, down thresh dB, down ratio, up thresh dB, up ratio,
+#  input trim dB, output/makeup trim dB)
+BANDS = [
+    dict(name="Low",  atk=47.8, rel=282.0, dt=-33.8, dr=66.7,   ut=-40.8, ur=4.17, ing=5.2, outg=10.3),
+    dict(name="Mid",  atk=22.4, rel=282.0, dt=-30.3, dr=66.7,   ut=-41.8, ur=4.17, ing=5.2, outg=5.7),
+    dict(name="High", atk=13.5, rel=132.0, dt=-35.5, dr=1000.0, ut=-40.8, ur=4.17, ing=5.2, outg=10.3),
+]
+KNEE_DB = 6.0               # soft-knee width
+INF_RATIO = 999.0           # down ratio >= this -> infinite (hard limit)
+TIME_LO, TIME_HI = 0.5, 2.0 # Time macro scales each band's times 0.5x .. 2x
 
-# Gain LUT indexing: idx = msb(env)*MANT + mantissa3bits, env is Q31 (<2^31)
+GMIN_DB, GMAX_DB = -24.0, 24.0   # total baked gain clamp (fixed-point headroom)
+GAIN_Q = 26                 # gain stored in Q26 (unity = 1<<26)
+
+# Gain LUT indexing: idx = msb(env)*MANT + mantissa3bits, env Q31 peak (<2^31)
 EXP_BITS = 31               # env msb in 0..30
 MANT = 8                    # mantissa buckets per octave
 
 
 def biquad(kind, f0):
-    w0 = 2.0 * np.pi * f0 / FS
-    cosw, sinw = np.cos(w0), np.sin(w0)
-    alpha = sinw / (2.0 * QBW)
+    """2nd-order Butterworth low/high-pass, or matched allpass, coeffs /SCALE."""
+    k = np.tan(np.pi * f0 / FS)
+    norm = 1.0 / (1.0 + SQRT2 * k + k * k)
+    a1 = 2.0 * (k * k - 1.0) * norm
+    a2 = (1.0 - SQRT2 * k + k * k) * norm
     if kind == 'lp':
-        b0 = (1 - cosw) / 2; b1 = 1 - cosw; b2 = (1 - cosw) / 2
-    else:  # hp
-        b0 = (1 + cosw) / 2; b1 = -(1 + cosw); b2 = (1 + cosw) / 2
-    a0 = 1 + alpha; a1 = -2 * cosw; a2 = 1 - alpha
-    c = np.array([b0, b1, b2, a1, a2]) / a0 / SCALE
+        b0 = k * k * norm; b1 = 2.0 * b0; b2 = b0
+    elif kind == 'hp':
+        b0 = norm; b1 = -2.0 * b0; b2 = b0
+    else:  # allpass equal to this crossover (numerator = reversed denominator)
+        b0 = a2; b1 = a1; b2 = 1.0
+    c = np.array([b0, b1, b2, a1, a2]) / SCALE
     if np.any(np.abs(c) > 1.0 + 1e-6):
         raise SystemExit(f"{kind}@{f0} coeff out of range: {c}")
     return [int(v) for v in np.clip(np.round(c * Q31), -2147483648, 2147483647)]
 
 
-def gain_for(env_lin):
-    if env_lin <= 0:
-        g = GMAX
-    else:
-        r = TARGET / env_lin
-        g = r ** (K_DOWN if env_lin >= TARGET else K_UP)
-    g = min(max(g, GMIN), GMAX)
+def soft_positive(x, width):
+    """max(x,0) with a quadratic soft knee of total `width` dB."""
+    if width <= 0:
+        return max(x, 0.0)
+    if x <= -width * 0.5:
+        return 0.0
+    if x >= width * 0.5:
+        return x
+    return (x + width * 0.5) ** 2 / (2.0 * width)
+
+
+def comp_gain_db(level_db, b):
+    """Summed upward+downward compression gain in dB for a band (full depth)."""
+    down_slope = 1.0 if b['dr'] >= INF_RATIO else 1.0 - 1.0 / b['dr']
+    up_slope = 1.0 - 1.0 / b['ur']
+    downward = -down_slope * soft_positive(level_db - b['dt'], KNEE_DB)
+    upward = min(up_slope * soft_positive(b['ut'] - level_db, KNEE_DB), 36.0)
+    # Fade upward compression out below ~-72 dBFS so the noise floor isn't lifted.
+    t = min(max((level_db + 90.0) / 18.0, 0.0), 1.0)
+    return downward + upward * t * t * (3.0 - 2.0 * t)
+
+
+def baked_gain(env_lin, b):
+    """Total linear gain (Q26) for a band at a detected peak level env_lin (0..1)."""
+    level_db = 20.0 * np.log10(env_lin) if env_lin > 0 else -200.0
+    # Input trim hits the detector level; in+out trims are the makeup gain.
+    g_db = b['ing'] + b['outg'] + comp_gain_db(level_db + b['ing'], b)
+    g_db = min(max(g_db, GMIN_DB), GMAX_DB)
+    g = 10.0 ** (g_db / 20.0)
     return int(min(round(g * (1 << GAIN_Q)), 2147483647))
+
+
+def env_coeff(ms):
+    # One-pole STEP coefficient for `env += coeff * (x - env)`: 1 - exp(-1/tau).
+    step = 1.0 - np.exp(-1.0 / (ms * 1e-3 * FS))
+    return int(min(round(step * Q31), 2147483647))
+
+
+def q31(x):
+    return int(min(max(round(x * Q31), -2147483648), 2147483647))
 
 
 def main():
     L = []
     L.append("#pragma once")
-    L.append("// Generated by gen_ott.py -- do not edit. 3-band OTT tables.")
+    L.append("// Generated by tools/gen_ott.py -- do not edit. Faithful 3-band OTT tables.")
     L.append("#include <opxy/types.hpp>")
     L.append("namespace ott {")
     L.append(f"const opxy::i32 kScaleShift = 2;   // output <<= 2 (SCALE {SCALE:g})")
@@ -61,22 +113,39 @@ def main():
     L.append(f"const opxy::i32 kGainUnity = {1 << GAIN_Q};")
     L.append(f"const unsigned kMant = {MANT};")
     L.append(f"const unsigned kExpMax = {EXP_BITS - 1};")
-    # crossover coeffs: [b0,b1,b2,a1,a2]/SCALE
-    for name, kind, f in (("kLP1", 'lp', F1), ("kHP1", 'hp', F1),
-                          ("kLP2", 'lp', F2), ("kHP2", 'hp', F2)):
+
+    # Crossover coeffs ([b0,b1,b2,a1,a2]/SCALE). LR4 = each LP/HP applied twice.
+    for name, kind, f in (("kLP_F1", 'lp', F1), ("kHP_F1", 'hp', F1),
+                          ("kLP_F2", 'lp', F2), ("kHP_F2", 'hp', F2),
+                          ("kAP_F2", 'ap', F2)):
         c = biquad(kind, f)
         L.append(f"const opxy::i32 {name}[5] = {{{', '.join(str(v) for v in c)}}};  // {kind}@{f:g}Hz")
-    # gain LUT
+
+    # Per-band attack/release, fast (Time=0) and slow (Time=1) endpoints.
+    af = [env_coeff(b['atk'] * TIME_LO) for b in BANDS]
+    as_ = [env_coeff(b['atk'] * TIME_HI) for b in BANDS]
+    rf = [env_coeff(b['rel'] * TIME_LO) for b in BANDS]
+    rs = [env_coeff(b['rel'] * TIME_HI) for b in BANDS]
+    L.append(f"const opxy::i32 kAtkFast[3] = {{{', '.join(map(str, af))}}};")
+    L.append(f"const opxy::i32 kAtkSlow[3] = {{{', '.join(map(str, as_))}}};")
+    L.append(f"const opxy::i32 kRelFast[3] = {{{', '.join(map(str, rf))}}};")
+    L.append(f"const opxy::i32 kRelSlow[3] = {{{', '.join(map(str, rs))}}};")
+
+    # Per-band baked gain LUTs.
     n = EXP_BITS * MANT
-    L.append(f"const opxy::i32 kGainLut[{n}] = {{")
-    row = []
-    for e in range(EXP_BITS):
-        for m in range(MANT):
-            env_rep = (2.0 ** e) * (1.0 + (m + 0.5) / MANT) / Q31
-            row.append(str(gain_for(env_rep)))
-    for i in range(0, len(row), 8):
-        L.append("  " + ", ".join(row[i:i + 8]) + ",")
-    L.append("};")
+    L.append(f"const unsigned kLutSize = {n};")
+    names = ["kGainLutLow", "kGainLutMid", "kGainLutHigh"]
+    for b, nm in zip(BANDS, names):
+        row = []
+        for e in range(EXP_BITS):
+            for m in range(MANT):
+                env_rep = (2.0 ** e) * (1.0 + (m + 0.5) / MANT) / Q31
+                row.append(str(baked_gain(env_rep, b)))
+        L.append(f"const opxy::i32 {nm}[{n}] = {{")
+        for i in range(0, len(row), 8):
+            L.append("  " + ", ".join(row[i:i + 8]) + ",")
+        L.append("};")
+    L.append("const opxy::i32* const kGainLut[3] = {kGainLutLow, kGainLutMid, kGainLutHigh};")
     L.append("}")
     print("\n".join(L))
 
