@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "sdk": "1.6",
+  "kind": "effect",
+  "description": "OTT-style 3-band multiband compressor (upward + downward)."
+}
