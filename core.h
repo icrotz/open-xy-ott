@@ -14,7 +14,8 @@ namespace ott {
 // gain LUT. State ~312 bytes, within the 476 limit.
 struct State {
     opxy::i32 x1[2][9], x2[2][9], y1[2][9], y2[2][9];  // crossover histories [ch][stage]
-    opxy::i32 env[3];   // per-band peak envelope (stereo-linked), Q31
+    opxy::i32 env[3];   // per-band envelope (stereo-linked), Q31: amplitude in
+                        // Peak mode, mean-square power in RMS mode (Detect menu)
     opxy::i32 gain[3];  // per-band smoothed gain, Q26
 };
 void initialize(State& state);

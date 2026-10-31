@@ -17,6 +17,21 @@ opxy::i32 absq(opxy::i32 x) { return x < 0 ? (x == kMinimum ? kMaximum : -x) : x
 
 unsigned msb(opxy::u32 v) { unsigned r = 0; while (v >>= 1) ++r; return r; }  // 0..31 (v>0)
 
+// Amplitude (Q31) from a Q31 power value: sqrt(p/2^31)*2^31 = isqrt(p << 31).
+// Integer bitwise sqrt of a <=62-bit value; only 64-bit add/shift-by-constant,
+// no 64-bit multiply or divide. Called a few times per block, never per sample.
+opxy::i32 amp_from_power(opxy::i32 power) {
+    opxy::i64 n = static_cast<opxy::i64>(power < 0 ? 0 : power) << 31;
+    opxy::i64 res = 0, bit = static_cast<opxy::i64>(1) << 60;  // highest even bit
+    while (bit > n) bit >>= 2;
+    while (bit) {
+        if (n >= res + bit) { n -= res + bit; res = (res >> 1) + bit; }
+        else res >>= 1;
+        bit >>= 2;
+    }
+    return static_cast<opxy::i32>(res);
+}
+
 // One Direct Form I biquad sample; coeffs are stored /SCALE, so the result is
 // shifted back by kScaleShift. Updates the four history words.
 inline opxy::i32 biquad(const opxy::i32 c[5], opxy::i32 x,
@@ -60,16 +75,20 @@ void process(State& state, opxy::Channel left, opxy::Channel right, opxy::Parame
     const opxy::i32 time  = parameters[1] < 0 ? 0 : parameters[1];
     const opxy::i32 pin = parameters[2], pout = parameters[3];
     const opxy::i32 bandp[3] = {parameters[4], parameters[5], parameters[6]};
+    // Detect menu (enum): 0 = Peak (amplitude), 1 = RMS (mean-square/power).
+    const bool rms = (parameters[7] >> 30) != 0;
 
     // Per-band attack/release coefficients, interpolated by the Time macro, and
-    // the per-block gain target + ramp from the current envelope.
+    // the per-block gain target + ramp from the current envelope. In RMS mode
+    // the envelope holds power, so convert it to amplitude for the gain LUT.
     opxy::i32 atk[3], rel[3], g[3], gstep[3];
     for (int b = 0; b < 3; ++b) {
         atk[b] = kAtkFast[b] + opxy::q31::multiply(time, kAtkSlow[b] - kAtkFast[b]);
         rel[b] = kRelFast[b] + opxy::q31::multiply(time, kRelSlow[b] - kRelFast[b]);
         opxy::i32 bd = bandp[b] < 0 ? 0 : bandp[b];
         opxy::i32 eff = opxy::q31::multiply(depth, bd);
-        opxy::i32 target = band_gain(b, state.env[b], eff);
+        opxy::i32 level = rms ? amp_from_power(state.env[b]) : state.env[b];
+        opxy::i32 target = band_gain(b, level, eff);
         g[b] = state.gain[b];
         gstep[b] = (target - state.gain[b]) / static_cast<opxy::i32>(opxy::block_frames);
         state.gain[b] = target;
@@ -100,8 +119,12 @@ void process(State& state, opxy::Channel left, opxy::Channel right, opxy::Parame
 
         opxy::i64 outl = 0, outr = 0;
         for (int b = 0; b < 3; ++b) {
-            // Stereo-linked peak detector feeds the envelope for next block.
-            opxy::i32 d = absq(bl[b]); opxy::i32 dr = absq(br[b]); if (dr > d) d = dr;
+            // Stereo-linked detector feeds the envelope for next block: peak
+            // amplitude (max |x|) or RMS power (max x^2), per the Detect menu.
+            opxy::i32 d, dr;
+            if (rms) { d = opxy::q31::multiply(bl[b], bl[b]); dr = opxy::q31::multiply(br[b], br[b]); }
+            else     { d = absq(bl[b]); dr = absq(br[b]); }
+            if (dr > d) d = dr;
             opxy::i32 diff = d - state.env[b];
             state.env[b] += opxy::q31::multiply(diff, diff > 0 ? atk[b] : rel[b]);
 

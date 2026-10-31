@@ -9,7 +9,8 @@
     {"id":"outgain","label":"Out Gain","default":0.5, "mapping":{"kind":"linear","minimum":0,"maximum":2}, "display":"percent"},
     {"id":"low",   "label":"Low",    "default":1,   "mapping":{"kind":"linear","minimum":0,"maximum":1}, "display":"percent", "control":0},
     {"id":"mid",   "label":"Mid",    "default":1,   "mapping":{"kind":"linear","minimum":0,"maximum":1}, "display":"percent", "control":1},
-    {"id":"high",  "label":"High",   "default":1,   "mapping":{"kind":"linear","minimum":0,"maximum":1}, "display":"percent", "control":2}
+    {"id":"high",  "label":"High",   "default":1,   "mapping":{"kind":"linear","minimum":0,"maximum":1}, "display":"percent", "control":2},
+    {"id":"detect","label":"Detect", "default":0,   "mapping":{"kind":"enum","labels":["Peak","RMS"]}, "display":"enum", "control":3}
   ],
   "presets": {},
   "resources": {}

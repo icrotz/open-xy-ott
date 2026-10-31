@@ -9,10 +9,12 @@ namespace {
 const opxy::i32 kUnity = 1 << 30;        // param 0.5 -> unity in/out gain
 const opxy::i32 kFull  = opxy::q31::maximum;
 
+opxy::i32 g_detect = 0;                  // 0 = Peak, 0x60000000 ~ RMS choice
 void params(opxy::i32 p[8], opxy::i32 depth) {
     p[0] = depth; p[1] = kUnity;         // depth, time
     p[2] = kUnity; p[3] = kUnity;        // in, out gain (unity)
-    p[4] = kFull; p[5] = kFull; p[6] = kFull; p[7] = 0;  // low/mid/high full
+    p[4] = kFull; p[5] = kFull; p[6] = kFull;  // low/mid/high full
+    p[7] = g_detect;                     // detect menu (Peak/RMS)
 }
 bool fail(const char* m) { std::puts(m); return false; }
 opxy::i32 tone(unsigned n, double f, double a) {
@@ -69,6 +71,17 @@ bool test_depth_off() { // depth 0 should pass the signal ~unchanged (unity)
     return true;
 }
 
+bool test_rms() {      // RMS detection must also compress a loud tone and stay
+                       // bounded (reads ~3 dB lower than peak, so a touch hotter)
+    g_detect = 0x60000000;                // select RMS choice
+    const double amp = 0x60000000;        // ~ -1.3 dBFS
+    double out = measure(amp, kFull, 96);
+    g_detect = 0;                         // restore Peak for later tests
+    if (out > amp)      return fail("FAIL RMS: loud signal not attenuated");
+    if (out > kFull)    return fail("FAIL RMS: output exceeds full scale");
+    return true;
+}
+
 bool test_tail() {     // after input stops the output must not run away, and
                        // must decay well below the drive (boosted floor is OK)
     const double drive = 0x30000000;
@@ -93,6 +106,7 @@ int main() {
     if (!test_depth_off()) return 1;
     if (!test_upward()) return 1;
     if (!test_downward()) return 1;
+    if (!test_rms()) return 1;
     if (!test_tail()) return 1;
     return 0;
 }
